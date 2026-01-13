@@ -1,0 +1,13 @@
+fastapi 
+uvicorn 
+python-multipart 
+pillow 
+opencv-python 
+rembg 
+numpy 
+pydantic 
+sqlalchemy 
+redis 
+python-jose[cryptography] 
+passlib[bcrypt] 
+aiofiles
