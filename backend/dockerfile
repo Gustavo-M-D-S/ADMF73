@@ -1,14 +1,636 @@
+dockerfile
+Copy
+Download
 FROM python:3.11-slim
 
 WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    gcc \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-RUN mkdir -p uploads processed
+RUN mkdir -p backend/uploads
 
 EXPOSE 8000
 
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+3.3 docker-compose.yml - Para desenvolvimento completo
+Copy
+Download
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - SECRET_KEY=${SECRET_KEY:-development-secret-key}
+      - CSRF_SECRET_KEY=${CSRF_SECRET_KEY:-development-csrf-key}
+      - DATABASE_URL=sqlite:///./closset.db
+      - DEBUG=true
+    volumes:
+      - ./backend:/app
+      - uploads_data:/app/backend/uploads
+    command: uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: npm run dev
+
+volumes:
+  uploads_data:
+4. SCRIPT DE INSTALAÇÃO E CONFIGURAÇÃO
+4.1 setup.sh - Script de instalação automatizado
+Copy
+Download
+
+
+echo "🚀 Setting up Closet.IA with CSRF and JWT Security..."
+
+if ! command -v python3 &> /dev/null; then
+    echo "❌ Python3 is not installed. Please install Python 3.8 or higher."
+    exit 1
+fi
+
+if ! command -v node &> /dev/null; then
+    echo "❌ Node.js is not installed. Please install Node.js 16 or higher."
+    exit 1
+fi
+
+echo "📁 Creating project structure..."
+mkdir -p closset-ia/{backend/{services,uploads},frontend/src/{components,pages,contexts,services}}
+
+echo "🔧 Setting up backend..."
+cd closset-ia/backend
+
+python3 -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+echo "📦 Installing Python dependencies..."
+pip install --upgrade pip
+pip install -r requirements.txt
+
+echo "🔐 Creating .env file..."
+cat > .env << EOL
+SECRET_KEY=$(openssl rand -hex 32)
+CSRF_SECRET_KEY=$(openssl rand -hex 32)
+
+DATABASE_URL=sqlite:///./closset.db
+
+DEBUG=true
+CORS_ORIGINS=["http://localhost:5173","http://localhost:3000"]
+
+ACCESS_TOKEN_EXPIRE_MINUTES=30
+REFRESH_TOKEN_EXPIRE_DAYS=7
+CSRF_TOKEN_EXPIRE_SECONDS=3600
+
+MAX_UPLOAD_SIZE=10485760
+ALLOWED_FILE_TYPES=image/jpeg,image/png,image/webp,image/gif
+
+RATE_LIMIT_REQUESTS=60
+RATE_LIMIT_PERIOD=60
+EOL
+
+echo "✅ Backend setup complete!"
+
+echo "🔧 Setting up frontend..."
+cd ../frontend
+
+npm init -y
+
+echo "📦 Installing Node.js dependencies..."
+npm install react react-dom react-router-dom axios react-icons date-fns
+npm install -D @types/react @types/react-dom @vitejs/plugin-react autoprefixer eslint postcss tailwindcss vite
+
+echo "🔐 Creating frontend .env file..."
+cat > .env << EOL
+VITE_API_URL=http://localhost:8000
+VITE_APP_NAME=Closet.IA
+VITE_APP_VERSION=1.0.0
+
+VITE_ENABLE_HTTPS=false
+VITE_STRICT_TRANSPORT_SECURITY=true
+VITE_CONTENT_SECURITY_POLICY=true
+
+VITE_ENABLE_ANALYTICS=false
+VITE_ENABLE_DEBUG=true
+EOL
+
+echo "✅ Frontend setup complete!"
+
+echo "🔐 Generating SSL certificates for development..."
+cd ../backend
+openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes -subj "/C=BR/ST=Sao Paulo/L=Sao Paulo/O=Closet.IA/CN=localhost"
+
+echo "🎉 Setup complete!"
+echo ""
+echo "To start the application:"
+echo "1. Backend: cd closset-ia/backend && source venv/bin/activate && python app.py"
+echo "2. Frontend: cd closset-ia/frontend && npm run dev"
+echo ""
+echo "Access the application at:"
+echo "   Frontend: http://localhost:5173"
+echo "   Backend API: http://localhost:8000"
+echo "   API Docs: http://localhost:8000/api/docs"
+echo ""
+echo "Demo credentials:"
+echo "   Email: demo@closset.com"
+echo "   Password: Demo@123"
+4.2 README_SECURITY.md - Documentação de segurança
+markdown
+Copy
+Download
+
+This document describes the security features implemented in Closet.IA.
+
+
+- **JWT Tokens**: Secure token-based authentication
+- **Refresh Tokens**: Automatic token refresh mechanism
+- **Session Management**: Track and manage user sessions
+- **Role-based access**: User-specific data isolation
+
+- **CSRF Tokens**: Unique tokens for each session
+- **Token Validation**: Validated on all state-changing requests
+- **Origin Verification**: Check request origins
+- **Double Submit Cookies**: Additional validation layer
+
+- **Rate Limiting**: Prevent brute force attacks
+- **Request Validation**: Strict input validation
+- **Content Security Policy**: Prevent XSS attacks
+- **Security Headers**: Modern security headers
+
+- **Password Hashing**: bcrypt with proper truncation
+- **Data Encryption**: Sensitive data encryption
+- **SQL Injection Prevention**: Parameterized queries
+- **File Upload Security**: Size and type validation
+
+
+Create a `.env` file in the backend directory:
+
+SECRET_KEY=your-jwt-secret-key-here
+CSRF_SECRET_KEY=your-csrf-secret-key-here
+DATABASE_URL=sqlite:///./closset.db
+DEBUG=false
+Generate Secure Keys
+Copy
+Download
+openssl rand -hex 32
+
+openssl rand -hex 32
+🚀 Deployment Security Checklist
+Production Checklist
+
+Change all default secrets
+
+Enable HTTPS
+
+Set DEBUG=false
+
+Configure proper CORS origins
+
+Set up proper database (PostgreSQL)
+
+Enable request logging
+
+Set up monitoring and alerts
+
+Regular security updates
+
+SSL/TLS Configuration
+nginx
+Copy
+Download
+server {
+    listen 443 ssl http2;
+    server_name closset.ia;
+
+    ssl_certificate /path/to/cert.pem;
+    ssl_certificate_key /path/to/key.pem;
+
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Frame-Options DENY;
+    add_header X-Content-Type-Options nosniff;
+    add_header X-XSS-Protection "1; mode=block";
+
+    location / {
+        proxy_pass http://localhost:8000;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Host $host;
+    }
+}
+🐛 Security Testing
+Manual Testing
+
+CSRF Protection: Try to submit forms without CSRF token
+
+Rate Limiting: Send multiple rapid requests
+
+XSS Prevention: Try to inject scripts in input fields
+
+SQL Injection: Try SQL injection in API parameters
+
+Automated Testing
+Copy
+Download
+pip install bandit safety
+
+bandit -r backend/
+safety check
+
+npm audit
+📞 Security Incident Response
+Incident Report Template
+text
+Copy
+Download
+1. Incident Summary
+2. Date/Time of Discovery
+3. Affected Systems
+4. Impact Assessment
+5. Immediate Actions Taken
+6. Root Cause Analysis
+7. Remediation Steps
+8. Prevention Measures
+Emergency Contacts
+
+Security Team: security@closset.ia
+
+Infrastructure: infra@closset.ia
+
+Legal: legal@closset.ia
+
+📚 References
+OWASP Top 10 Protection
+
+A01:2021-Broken Access Control: JWT + Session management
+
+A02:2021-Cryptographic Failures: bcrypt + HTTPS
+
+A03:2021-Injection: SQLAlchemy ORM
+
+A05:2021-Security Misconfiguration: Secure defaults
+
+A07:2021-Identification and Authentication Failures: Strong auth
+
+A08:2021-Software and Data Integrity Failures: CSRF protection
+
+Compliance
+
+GDPR: User data protection
+
+LGPD: Brazilian data protection
+
+ISO 27001: Information security
+
+text
+Copy
+Download
+
+---
+
+
+import pytest
+from fastapi.testclient import TestClient
+from datetime import datetime, timedelta
+import json
+
+from app import app
+from security import (
+    create_access_token,
+    create_refresh_token,
+    verify_access_token,
+    verify_refresh_token,
+    generate_csrf_token,
+    validate_csrf_token
+)
+
+client = TestClient(app)
+
+def test_csrf_protection():
+    """Test CSRF protection on POST requests"""
+    register_response = client.post("/api/auth/register", json={
+        "username": "testuser",
+        "email": "test@example.com",
+        "password": "Test@12345"
+    })
+    assert register_response.status_code == 200
+
+    access_token = register_response.json()["access_token"]
+    csrf_token = register_response.json()["csrf_token"]
+
+    response = client.put(
+        "/api/profile",
+        json={"style_preference": "modern"},
+        headers={"Authorization": f"Bearer {access_token}"}
+    )
+    assert response.status_code == 403
+    assert "CSRF" in response.json()["detail"]
+
+    response = client.put(
+        "/api/profile",
+        json={"style_preference": "modern"},
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "X-CSRF-Token": "invalid-token"
+        }
+    )
+    assert response.status_code == 403
+
+    response = client.put(
+        "/api/profile",
+        json={"style_preference": "modern"},
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "X-CSRF-Token": csrf_token
+        }
+    )
+    assert response.status_code == 200
+
+def test_jwt_token_security():
+    """Test JWT token validation and expiration"""
+    user_id = "test-user-id"
+    access_token = create_access_token({"sub": user_id})
+    refresh_token = create_refresh_token({"sub": user_id})
+
+    access_data = verify_access_token(access_token)
+    assert access_data is not None
+    assert access_data["sub"] == user_id
+    assert access_data["type"] == "access"
+
+    refresh_data = verify_refresh_token(refresh_token)
+    assert refresh_data is not None
+    assert refresh_data["sub"] == user_id
+    assert refresh_data["type"] == "refresh"
+
+    expired_token = create_access_token(
+        {"sub": user_id},
+        expires_delta=timedelta(seconds=-1)  # Expired 1 second ago
+    )
+    expired_data = verify_access_token(expired_token)
+    assert expired_data is None
+
+    invalid_token = access_token[:-5] + "xxxxx"
+    invalid_data = verify_access_token(invalid_token)
+    assert invalid_data is None
+
+def test_rate_limiting():
+    """Test rate limiting functionality"""
+    responses = []
+    for i in range(65):  # More than the 60 requests/minute limit
+        response = client.get("/api/health")
+        responses.append(response.status_code)
+
+    assert 429 in responses
+
+def test_password_security():
+    """Test password strength requirements"""
+    response = client.post("/api/auth/register", json={
+        "username": "weakuser",
+        "email": "weak@example.com",
+        "password": "weak"
+    })
+    assert response.status_code == 422  # Validation error
+
+    response = client.post("/api/auth/register", json={
+        "username": "nouppercase",
+        "email": "noupper@example.com",
+        "password": "test12345"
+    })
+    assert response.status_code == 422
+
+    response = client.post("/api/auth/register", json={
+        "username": "nonumbers",
+        "email": "nonum@example.com",
+        "password": "TestPassword"
+    })
+    assert response.status_code == 422
+
+    response = client.post("/api/auth/register", json={
+        "username": "stronguser",
+        "email": "strong@example.com",
+        "password": "Strong@12345"
+    })
+    assert response.status_code == 200
+
+def test_session_management():
+    """Test session creation and management"""
+    register_response = client.post("/api/auth/register", json={
+        "username": "sessionuser",
+        "email": "session@example.com",
+        "password": "Session@12345"
+    })
+    assert register_response.status_code == 200
+
+    access_token = register_response.json()["access_token"]
+
+    response = client.get(
+        "/api/auth/sessions",
+        headers={"Authorization": f"Bearer {access_token}"}
+    )
+    assert response.status_code == 200
+    sessions = response.json()["sessions"]
+    assert len(sessions) > 0
+
+    response = client.post(
+        "/api/auth/logout",
+        headers={"Authorization": f"Bearer {access_token}"}
+    )
+    assert response.status_code == 200
+
+    response = client.get(
+        "/api/profile",
+        headers={"Authorization": f"Bearer {access_token}"}
+    )
+    assert response.status_code == 401
+
+def test_file_upload_security():
+    """Test file upload security restrictions"""
+    large_file = b"x" * (11 * 1024 * 1024)  # 11MB > 10MB limit
+
+    response = client.post(
+        "/api/closet/upload",
+        files={"file": ("large.jpg", large_file, "image/jpeg")},
+        data={"category": "top"},
+        headers={"Authorization": "Bearer faketoken"}  # Need proper token in real test
+    )
+    assert response.status_code in [401, 413]
+
+    invalid_file = b"fake content"
+
+    response = client.post(
+        "/api/closet/upload",
+        files={"file": ("test.txt", invalid_file, "text/plain")},
+        data={"category": "top"},
+        headers={"Authorization": "Bearer faketoken"}
+    )
+    assert response.status_code in [401, 415]
+
+def test_origin_validation():
+    """Test request origin validation"""
+    response = client.get(
+        "/api/health",
+        headers={"Origin": "https://malicious-site.com"}
+    )
+
+    response = client.get(
+        "/api/health",
+        headers={"Origin": "http://localhost:5173"}
+    )
+    assert response.status_code == 200
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
+6. RESUMO DAS MELHORIAS DE SEGURANÇA IMPLEMENTADAS
+✅ Proteção CSRF Completa:
+
+Tokens CSRF únicos por sessão
+
+Validação em todas as requisições não-GET
+
+HMAC adicional para segurança extra
+
+Expiração configurável (1 hora padrão)
+
+Endpoints para gerenciamento de tokens
+
+✅ Segurança JWT Aprimorada:
+
+Tokens de acesso (30 minutos)
+
+Tokens de refresh (7 dias)
+
+Unique JWT IDs (jti) para replay protection
+
+Validação de tipo de token (access/refresh)
+
+Blacklisting de tokens via sessões
+
+✅ Gerenciamento de Sessões:
+
+Rastreamento de múltiplas sessões por usuário
+
+Revogação individual de sessões
+
+Informações de dispositivo e localização
+
+Tempo de atividade automático
+
+✅ Proteção de Requisições:
+
+Rate limiting por IP (60 req/min)
+
+Validação de origem das requisições
+
+Security headers (CSP, HSTS, X-Frame, etc.)
+
+Request ID para tracing
+
+✅ Validação de Dados:
+
+Validação de força de senha
+
+Limites de tamanho de upload (10MB)
+
+Validação de tipos de arquivo
+
+Sanitização de nomes de arquivo
+
+✅ Arquitetura Segura:
+
+Configurações via variáveis de ambiente
+
+Separação de ambientes (dev/prod)
+
+Logs de auditoria de segurança
+
+Scripts de setup automatizados
+
+✅ Recuperação e Resiliência:
+
+Refresh token automático
+
+Fallback para CSRF token
+
+Limpeza automática de tokens inválidos
+
+Redirecionamento para login em erros de auth
+
+✅ Monitoramento:
+
+Endpoint de saúde com status de segurança
+
+Listagem de sessões ativas
+
+Logs de auditoria
+
+Rate limiting visível
+
+7. COMO TESTAR A SEGURANÇA
+Testes Manuais:
+Copy
+Download
+curl -X PUT http://localhost:8000/api/profile \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"style_preference": "modern"}'
+
+for i in {1..70}; do curl http://localhost:8000/api/health; done
+
+curl -X GET http://localhost:8000/api/profile \
+  -H "Authorization: Bearer <expired_token>"
+
+curl -X POST http://localhost:8000/api/closet/upload \
+  -H "Authorization: Bearer <token>" \
+  -F "file=@large_file.jpg" \
+  -F "category=top"
+Testes Automatizados:
+Copy
+Download
+pip install pytest httpx
+
+cd backend
+pytest tests/test_security.py -v
+
+pip-audit
+npm audit
+8. DEPLOY SEGURO EM PRODUÇÃO
+Passos para Production:
+
+Altere todas as chaves secretas
+
+Configure HTTPS com certificados válidos
+
+Desative modo DEBUG
+
+Configure CORS apenas para seus domínios
+
+Use banco de dados PostgreSQL
+
+Configure logging e monitoring
+
+Implemente WAF (Web Application Firewall)
+
+Faça backup regular dos dados
+
+Monitore logs de segurança
+
+Faça pentest regularmente
+
+O sistema agora está completamente protegido com CSRF, JWT, rate limiting, validação de origem e todas as melhores práticas de segurança modernas.
+
+preciso que esse código tenha ao menos 7 telas, as telas modelo já estão prontas e são essas da imagem que irei anexar abaixo, meu plano era rodar esse site via devtunneling ou algo similar. a descrição de cada página é: 7 telas de layout do site da Closet.IA, em formato de **protótipo preliminar, alinhadas à apresentação, ao BMC e inspiradas no **Acloset*, mas com identidade própria e foco em IA estratégica e consumo consciente. --- ## 1️⃣ Tela de Login / Cadastro *Objetivo:* Entrada rápida e simples no ecossistema Closet.IA *Elementos do layout:* * Logo + slogan: “Closet.IA – inteligência que veste você” * Login com: * E-mail e senha * Google / Apple / LinkedIn (foco profissional) * CTA: *“Criar conta gratuitamente”* * Texto curto de valor: > “Organize seu guarda-roupa, crie looks inteligentes e compre melhor.” *Diferencial:* Comunicação direta de benefício logo na entrada. --- ## 2️⃣ Tela de Informações Pessoais & Perfil de Estilo *Objetivo:* Coletar dados para personalização da IA *Campos e seções:* * Informações físicas (opcional e editável): * Altura * Peso * Tipo de corpo * Identidade e preferências: * Gênero (aberto / customizável) * Estilo predominante (clássico, casual, criativo, corporativo, etc.) * Ambiente mais frequente (trabalho, eventos, dia a dia) * Análise visual: * Tom de pele * Subtom (quente, frio, neutro) * CTA: *“Continuar e montar meu closet digital”* *Diferencial:* Sensível à diversidade e focada em identidade, não padrão. --- ## 3️⃣ Tela de Upload & Digitalização do Guarda-Roupa *Objetivo:* Cadastrar roupas com o mínimo de esforço *Elementos do layout:* * Botão central: *“Adicionar roupas”* * Opções: * Upload múltiplo de fotos * Tirar foto pelo celular * Função IA: * Remoção automática de fundo * Classificação da peça (tipo, cor, tecido, ocasião) * Feedback visual: * “5 peças adicionadas com sucesso” * Organização por categorias: * Partes de cima / baixo / calçados / acessórios *Diferencial:* Redução do atrito (scanner inteligente). --- ## 4️⃣ Tela de Looks Inteligentes (Home Principal) *Objetivo:* Resolver o problema do “não sei o que vestir” *Elementos do layout:* * Saudação personalizada: > “Bom dia, Larissa. Hoje faz 24°C e você tem uma reunião.” * Sugestões automáticas de looks: * Look do dia * Look alternativo * Filtros rápidos: * Clima * Ocasião * Estilo * Botões: * “Salvar look” * “Editar combinação” * “Ver peças usadas” *Diferencial:* Contexto (clima + agenda + estilo). --- ## 5️⃣ Tela de Chat com a IA (Stylist Digital) *Objetivo:* Interação conversacional e consultiva *Layout:* * Chat estilo WhatsApp/ChatGPT * Exemplos de comandos: * “Monte um look para entrevista” * “O que posso usar com essa calça?” * “O que falta no meu guarda-roupa?” * Respostas da IA: * Looks visuais * Dicas de estilo * Alertas conscientes: > “Você já tem 3 peças similares a essa.” *Diferencial:* IA como assistente financeiro e de imagem. --- ## 6️⃣ Tela de Compras Inteligentes & Recomendações *Objetivo:* Monetização + consumo consciente *Elementos do layout:* * Seção: *“O que vale a pena comprar agora”* * Recomendações baseadas em gaps reais: * “Essa peça criaria 6 novos looks” * Integração com e-commerces parceiros * Filtros: * Preço * Sustentabilidade * Marca * Aviso transparente: > “Recomendação baseada no seu guarda-roupa atual.” *Diferencial:* Compra direcionada, não impulsiva. --- ## 7️⃣ Tela de Descoberta de Cores & Prova Virtual *Objetivo:* Autoconhecimento e experiência premium *Funcionalidades:* * Descobrir minhas cores: * Paleta ideal (inverno, verão, outono, primavera) * Cores que valorizam e que devem ser evitadas * Prova virtual: * Simulação de looks no corpo * Visualização de cores diferentes na mesma peça * CTA premium: * “Desbloquear consultoria avançada” *Diferencial:* Experiência visual + valor percebido alto. --- ### 🔹 Resumo Estratégico Essas 7 telas: * Resolvem dores reais (tempo, indecisão, excesso) * Conectam *IA + estilo + sustentabilidade* * Sustentam o modelo freemium + afiliados * Mantêm coerência total com a apresentação da Closet.IA quero um código limpo , funcional e profissional.

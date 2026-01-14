@@ -1,585 +1,891 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form, Query, Request, Response
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
-from sqlalchemy import func
-import uuid
-import shutil
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional
 import os
-from datetime import datetime
+import shutil
+import json
 
-# Importar funções do seu projeto
-from database import get_db, init_db
-from models import User, ClothingItem, Outfit, Base
-from services.recommendation_engine import RecommendationEngine
-from utils.image_utils import ImageProcessor
+from config import settings
+from database import SessionLocal, engine, Base, init_db, get_db
+from models import User, ClothingItem, Outfit, StyleProfile, ChatMessage, generate_uuid, UserSession
+from services.recommendation_engine import engine as recommendation_engine
+from security import (
+    TokenSecurity,
+    verify_password,
+    get_password_hash,
+    create_access_token,
+    create_refresh_token,
+    verify_access_token,
+    verify_refresh_token,
+    generate_csrf_token,
+    validate_csrf_token,
+    validate_request_origin,
+    generate_session_id,
+    get_security_headers,
+    rate_limiter
+)
+from pydantic import BaseModel, EmailStr, validator
+import secrets
 
-app = FastAPI(title="Closset.IA API", version="1.0.0")
-
-# Inicializar engines
-recommendation_engine = RecommendationEngine()
-image_processor = ImageProcessor()
-
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Em produção, especifique domínios
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+app = FastAPI(
+    title=settings.APP_NAME,
+    version=settings.APP_VERSION,
+    description="API para plataforma de personal styling baseada em IA",
+    docs_url="/api/docs" if settings.DEBUG else None,
+    redoc_url="/api/redoc" if settings.DEBUG else None
 )
 
-# Criar banco de dados na inicialização
-@app.on_event("startup")
-def startup_event():
-    init_db()
-    print("✅ Banco de dados inicializado")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_headers=["*"],
+    expose_headers=["X-CSRF-Token", "X-Request-ID"]
+)
 
-# Models Pydantic para validação
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["localhost", "127.0.0.1", "closset.ia", "*.closset.ia"]
+)
+
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads")
+
+token_security = TokenSecurity()
+
+class UserCreate(BaseModel):
+    username: str
+    email: EmailStr
+    password: str
+
+    @validator('password')
+    def validate_password(cls, v):
+        if len(v) < 8:
+            raise ValueError('A senha deve ter pelo menos 8 caracteres')
+        if not any(c.isupper() for c in v):
+            raise ValueError('A senha deve conter pelo menos uma letra maiúscula')
+        if not any(c.isdigit() for c in v):
+            raise ValueError('A senha deve conter pelo menos um número')
+        return v
+
+    @validator('username')
+    def validate_username(cls, v):
+        if len(v) < 3:
+            raise ValueError('Nome de usuário deve ter pelo menos 3 caracteres')
+        if not v.isalnum():
+            raise ValueError('Nome de usuário deve conter apenas letras e números')
+        return v
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+    csrf_token: Optional[str] = None
+
+class TokenResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    csrf_token: str
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+class UserProfileUpdate(BaseModel):
+    height: Optional[float] = None
+    weight: Optional[float] = None
+    gender: Optional[str] = None
+    body_type: Optional[str] = None
+    style_preference: Optional[str] = None
+    skin_tone: Optional[str] = None
+    skin_undertone: Optional[str] = None
+
 class ClothingItemCreate(BaseModel):
-    name: Optional[str] = None
     category: str
+    subcategory: Optional[str] = None
     color: str
+    fabric: Optional[str] = None
     brand: Optional[str] = None
-    size: Optional[str] = None
-    season: str = "all"
-    tags: List[str] = []
+    price: Optional[float] = None
+    occasion: Optional[List[str]] = None
+    season: Optional[List[str]] = None
+    is_sustainable: Optional[bool] = False
 
 class OutfitCreate(BaseModel):
-    name: Optional[str] = None
-    occasion: str = "casual"
-    weather: str = "moderate"
-    items: List[str]  # IDs das peças
-    is_favorite: bool = False
+    name: Optional[str] = "Look do Dia"
+    item_ids: List[str]
+    occasion: str
+    weather: str
+    temperature: Optional[int] = None
+    style: str
+    notes: Optional[str] = None
 
-# Endpoints
+class ChatMessageCreate(BaseModel):
+    content: str
+    message_type: str = "text"
 
-@app.get("/")
-def read_root():
-    return {"message": "Closset.IA API - MVP", "status": "online", "version": "1.0.0"}
+class ColorAnalysisRequest(BaseModel):
+    skin_tone: str
+    eye_color: Optional[str] = None
+    hair_color: Optional[str] = None
 
-@app.get("/health")
-def health_check():
-    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+class UserResponse(BaseModel):
+    id: str
+    username: str
+    email: str
+    height: Optional[float]
+    weight: Optional[float]
+    gender: Optional[str]
+    style_preference: Optional[str]
+    skin_tone: Optional[str]
+    created_at: datetime
+    last_login: Optional[datetime]
 
-@app.post("/api/upload-clothing")
-async def upload_clothing_item(
-    file: UploadFile = File(...),
-    category: str = "unknown",
-    user_id: str = "demo",
+    class Config:
+        from_attributes = True
+
+class ClothingItemResponse(BaseModel):
+    id: str
+    category: str
+    subcategory: Optional[str]
+    color: str
+    color_hex: Optional[str]
+    image_url: str
+    brand: Optional[str]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+
+    security_headers = get_security_headers()
+    for header, value in security_headers.items():
+        response.headers[header] = value
+
+    request_id = request.headers.get("X-Request-ID", secrets.token_urlsafe(16))
+    response.headers["X-Request-ID"] = request_id
+
+    return response
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    if request.url.path in ["/api/docs", "/api/redoc", "/api/health", "/api/auth/csrf"]:
+        return await call_next(request)
+
+    if not validate_request_origin(request):
+        return Response(
+            content=json.dumps({"detail": "Origem da requisição não permitida"}),
+            status_code=status.HTTP_403_FORBIDDEN,
+            media_type="application/json"
+        )
+
+    client_ip = request.client.host
+    if not rate_limiter.is_allowed(client_ip):
+        return Response(
+            content=json.dumps({"detail": "Muitas requisições. Tente novamente mais tarde."}),
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            media_type="application/json"
+        )
+
+    return await call_next(request)
+
+async def get_current_user(
+    token_data: Dict = Depends(token_security),
     db: Session = Depends(get_db)
 ):
-    """Endpoint para upload de peças de roupa"""
-    try:
-        # Validar tipo de arquivo
-        if not file.content_type.startswith('image/'):
-            raise HTTPException(status_code=400, detail="Arquivo deve ser uma imagem")
-        
-        # Gerar ID único
-        item_id = str(uuid.uuid4())
-        file_extension = file.filename.split('.')[-1] if '.' in file.filename else 'jpg'
-        
-        # Criar pasta uploads se não existir
-        os.makedirs("uploads", exist_ok=True)
-        
-        # Salvar imagem temporariamente
-        temp_path = f"uploads/temp_{item_id}.{file_extension}"
-        
-        with open(temp_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
-        
-        # Processar imagem (remover fundo, extrair características)
-        try:
-            # Ler imagem para processamento
-            with open(temp_path, "rb") as f:
-                image_data = f.read()
-            
-            # Remover fundo
-            processed_image = image_processor.remove_background(image_data)
-            
-            # Salvar imagem sem fundo
-            processed_path = f"uploads/processed_{item_id}.png"
-            with open(processed_path, "wb") as f:
-                f.write(processed_image)
-            
-            # Extrair características
-            features = image_processor.extract_dominant_color(processed_path)
-            detected_category, main_category = image_processor.detect_category_by_aspect(processed_path)
-            
-            # Usar categoria detectada se não especificada
-            if category == "unknown":
-                category = main_category
-            
-            # Determinar cor dominante
-            dominant_color = features[0] if features else "#808080"
-            
-        except Exception as img_error:
-            print(f"Erro no processamento de imagem: {img_error}")
-            # Usar valores padrão se o processamento falhar
-            processed_path = temp_path
-            dominant_color = "#808080"
-            detected_category = category
-        
-        # Criar item no banco de dados
-        db_item = ClothingItem(
-            id=item_id,
-            user_id=user_id,
-            name=f"{detected_category.capitalize()} {dominant_color}",
-            category=category,
-            color=dominant_color,
-            image_url=f"/uploads/{item_id}.{file_extension}",
-            processed_url=processed_path,
-            features={
-                "colors": features,
-                "detected_category": detected_category,
-                "original_filename": file.filename
-            }
-        )
-        
-        db.add(db_item)
-        db.commit()
-        db.refresh(db_item)
-        
-        # Limpar arquivo temporário original
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        
-        return {
-            "success": True,
-            "item_id": item_id,
-            "message": "Item cadastrado com sucesso",
-            "data": {
-                "id": db_item.id,
-                "name": db_item.name,
-                "category": db_item.category,
-                "color": db_item.color,
-                "image_url": db_item.image_url,
-                "created_at": db_item.created_at.isoformat() if db_item.created_at else None
-            }
-        }
-        
-    except Exception as e:
-        # Limpar arquivos temporários em caso de erro
-        for path in [temp_path, processed_path]:
-            if 'path' in locals() and path and os.path.exists(path):
-                os.remove(path)
-        
-        raise HTTPException(status_code=500, detail=f"Erro no processamento: {str(e)}")
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
-@app.get("/api/closet/{user_id}")
-def get_user_closet(user_id: str, db: Session = Depends(get_db)):
-    """Retorna todas as peças do guarda-roupa do usuário"""
-    user_items = db.query(ClothingItem).filter(
-        ClothingItem.user_id == user_id,
-        ClothingItem.is_active == True
-    ).all()
-    
-    # Converter para dict
-    items_data = []
-    for item in user_items:
-        items_data.append({
+    try:
+        user_id = token_data.get("sub")
+        if user_id is None:
+            raise credentials_exception
+
+        user = db.query(User).filter(User.id == user_id).first()
+        if user is None:
+            raise credentials_exception
+
+        session = db.query(UserSession).filter(
+            UserSession.user_id == user_id,
+            UserSession.token_jti == token_data.get("jti"),
+            UserSession.is_active == True
+        ).first()
+
+        if not session:
+            raise credentials_exception
+
+        return user
+
+    except Exception:
+        raise credentials_exception
+
+def get_csrf_token(user: User = Depends(get_current_user)):
+    return generate_csrf_token(user.id)
+
+@app.get("/api/auth/csrf")
+async def get_csrf_token_public():
+    """Endpoint para obter CSRF token inicial (para login/register)"""
+    temp_user_id = f"temp_{secrets.token_urlsafe(16)}"
+    csrf_token = generate_csrf_token(temp_user_id)
+
+    return {
+        "csrf_token": csrf_token,
+        "expires_in": settings.CSRF_TOKEN_EXPIRE_SECONDS
+    }
+
+@app.post("/api/auth/register", response_model=TokenResponse)
+def register_user(
+    user: UserCreate,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    csrf_token = request.headers.get("X-CSRF-Token")
+    if not csrf_token:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="CSRF token necessário"
+        )
+
+    db_user = db.query(User).filter(User.email == user.email).first()
+    if db_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email já registrado"
+        )
+
+    db_user = db.query(User).filter(User.username == user.username).first()
+    if db_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Nome de usuário já existe"
+        )
+
+    hashed_password = get_password_hash(user.password)
+    new_user = User(
+        id=generate_uuid(),
+        username=user.username,
+        email=user.email,
+        hashed_password=hashed_password,
+        created_at=datetime.utcnow()
+    )
+
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+
+    style_profile = StyleProfile(
+        id=generate_uuid(),
+        user_id=new_user.id,
+        preferred_styles=["casual"],
+        preferred_colors=[],
+        avoided_colors=[],
+        color_palette=[]
+    )
+    db.add(style_profile)
+
+    access_token = create_access_token(data={"sub": new_user.id})
+    refresh_token = create_refresh_token(data={"sub": new_user.id})
+
+    access_token_data = verify_access_token(access_token)
+    refresh_token_data = verify_refresh_token(refresh_token)
+
+    session = UserSession(
+        id=generate_uuid(),
+        user_id=new_user.id,
+        access_token_jti=access_token_data.get("jti"),
+        refresh_token_jti=refresh_token_data.get("jti"),
+        ip_address=request.client.host,
+        user_agent=request.headers.get("user-agent", ""),
+        is_active=True,
+        created_at=datetime.utcnow(),
+        last_activity=datetime.utcnow()
+    )
+    db.add(session)
+
+    db.commit()
+
+    csrf_token = generate_csrf_token(new_user.id)
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "csrf_token": csrf_token
+    }
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+def login_user(
+    login: UserLogin,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    if not login.csrf_token:
+        csrf_token = request.headers.get("X-CSRF-Token")
+        if not csrf_token:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="CSRF token necessário"
+            )
+
+    client_ip = request.client.host
+    login_key = f"login_attempts_{client_ip}"
+
+    if not rate_limiter.is_allowed(f"login_{client_ip}"):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUISITIONS,
+            detail="Muitas tentativas de login. Tente novamente em alguns minutos."
+        )
+
+    user = db.query(User).filter(User.email == login.email).first()
+    if not user or not verify_password(login.password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Email ou senha incorretos",
+        )
+
+    user.last_login = datetime.utcnow()
+
+
+    access_token = create_access_token(data={"sub": user.id})
+    refresh_token = create_refresh_token(data={"sub": user.id})
+
+    access_token_data = verify_access_token(access_token)
+    refresh_token_data = verify_refresh_token(refresh_token)
+
+    session = UserSession(
+        id=generate_uuid(),
+        user_id=user.id,
+        access_token_jti=access_token_data.get("jti"),
+        refresh_token_jti=refresh_token_data.get("jti"),
+        ip_address=request.client.host,
+        user_agent=request.headers.get("user-agent", ""),
+        is_active=True,
+        created_at=datetime.utcnow(),
+        last_activity=datetime.utcnow()
+    )
+    db.add(session)
+
+    db.commit()
+
+    csrf_token = generate_csrf_token(user.id)
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "csrf_token": csrf_token
+    }
+
+@app.post("/api/auth/refresh", response_model=TokenResponse)
+def refresh_token(
+    refresh_request: RefreshTokenRequest,
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    token_data = verify_refresh_token(refresh_request.refresh_token)
+    if not token_data:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token inválido ou expirado"
+        )
+
+    user_id = token_data.get("sub")
+    token_jti = token_data.get("jti")
+
+    session = db.query(UserSession).filter(
+        UserSession.user_id == user_id,
+        UserSession.refresh_token_jti == token_jti,
+        UserSession.is_active == True
+    ).first()
+
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token não encontrado na sessão"
+        )
+
+    session.is_active = False
+    session.ended_at = datetime.utcnow()
+
+    access_token = create_access_token(data={"sub": user_id})
+    refresh_token = create_refresh_token(data={"sub": user_id})
+
+    access_token_data = verify_access_token(access_token)
+    refresh_token_data = verify_refresh_token(refresh_token)
+
+    new_session = UserSession(
+        id=generate_uuid(),
+        user_id=user_id,
+        access_token_jti=access_token_data.get("jti"),
+        refresh_token_jti=refresh_token_data.get("jti"),
+        ip_address=request.client.host,
+        user_agent=request.headers.get("user-agent", ""),
+        is_active=True,
+        created_at=datetime.utcnow(),
+        last_activity=datetime.utcnow()
+    )
+    db.add(new_session)
+
+    db.commit()
+
+    csrf_token = generate_csrf_token(user_id)
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "csrf_token": csrf_token
+    }
+
+@app.post("/api/auth/logout")
+def logout_user(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    db.query(UserSession).filter(
+        UserSession.user_id == current_user.id,
+        UserSession.is_active == True
+    ).update({
+        "is_active": False,
+        "ended_at": datetime.utcnow()
+    })
+
+    db.commit()
+
+    return {"message": "Logout realizado com sucesso"}
+
+@app.get("/api/auth/sessions")
+def get_user_sessions(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Retorna todas as sessões ativas do usuário"""
+    sessions = db.query(UserSession).filter(
+        UserSession.user_id == current_user.id
+    ).order_by(UserSession.created_at.desc()).all()
+
+    return {"sessions": sessions}
+
+@app.post("/api/auth/sessions/{session_id}/revoke")
+def revoke_session(
+    session_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Revoga uma sessão específica"""
+    session = db.query(UserSession).filter(
+        UserSession.id == session_id,
+        UserSession.user_id == current_user.id
+    ).first()
+
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Sessão não encontrada"
+        )
+
+    session.is_active = False
+    session.ended_at = datetime.utcnow()
+
+    db.commit()
+
+    return {"message": "Sessão revogada com sucesso"}
+
+@app.get("/api/profile", response_model=UserResponse)
+def get_profile(
+    current_user: User = Depends(get_current_user),
+    csrf_token: str = Depends(get_csrf_token)
+):
+    response = UserResponse.from_orm(current_user)
+    return response
+
+@app.put("/api/profile")
+def update_profile(
+    profile_update: UserProfileUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+
+    for field, value in profile_update.dict(exclude_unset=True).items():
+        setattr(current_user, field, value)
+
+    current_user.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(current_user)
+
+    return {"message": "Perfil atualizado com sucesso", "user": current_user}
+
+@app.post("/api/closet/upload")
+async def upload_clothing_item(
+    file: UploadFile = File(...),
+    category: str = Form("uncategorized"),
+    subcategory: Optional[str] = Form(None),
+    color: Optional[str] = Form(None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+
+    file.file.seek(0, 2)  # Vai para o final do arquivo
+    file_size = file.file.tell()
+    file.file.seek(0)  # Volta para o início
+
+    if file_size > settings.MAX_UPLOAD_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Arquivo muito grande. Tamanho máximo: {settings.MAX_UPLOAD_SIZE / (1024*1024)}MB"
+        )
+
+    allowed_types = ["image/jpeg", "image/png", "image/webp", "image/gif"]
+    if file.content_type not in allowed_types:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Tipo de arquivo não suportado. Tipos permitidos: {', '.join(allowed_types)}"
+        )
+
+    upload_dir = settings.UPLOAD_DIR
+    os.makedirs(upload_dir, exist_ok=True)
+
+    file_extension = file.filename.split(".")[-1] if "." in file.filename else "jpg"
+    item_id = generate_uuid()
+
+    safe_filename = f"{item_id}.{file_extension}"
+    file_path = os.path.join(upload_dir, safe_filename)
+
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    processed_data = await recommendation_engine.process_clothing_image(file_path)
+
+    clothing_item = ClothingItem(
+        id=item_id,
+        user_id=current_user.id,
+        category=category,
+        subcategory=subcategory or processed_data.get("subcategory", "uncategorized"),
+        color=color or processed_data.get("color", "unknown"),
+        color_hex=processed_data.get("color", "#808080"),
+        image_url=f"/uploads/{safe_filename}",
+        processed_features=processed_data,
+        created_at=datetime.utcnow()
+    )
+
+    db.add(clothing_item)
+    db.commit()
+    db.refresh(clothing_item)
+
+    return {
+        "message": "Peça adicionada com sucesso",
+        "item": clothing_item,
+        "analysis": processed_data
+    }
+
+@app.get("/api/closet", response_model=List[ClothingItemResponse])
+def get_closet_items(
+    category: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    csrf_token: str = Depends(get_csrf_token)
+):
+
+    query = db.query(ClothingItem).filter(ClothingItem.user_id == current_user.id)
+
+    if category:
+        query = query.filter(ClothingItem.category == category)
+
+    items = query.order_by(ClothingItem.created_at.desc()).all()
+    return items
+
+@app.delete("/api/closet/{item_id}")
+def delete_clothing_item(
+    item_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+
+    item = db.query(ClothingItem).filter(
+        ClothingItem.id == item_id,
+        ClothingItem.user_id == current_user.id
+    ).first()
+
+    if not item:
+        raise HTTPException(status_code=404, detail="Item não encontrado")
+
+    if item.image_url:
+        image_path = item.image_url.replace("/uploads/", f"{settings.UPLOAD_DIR}/")
+        if os.path.exists(image_path):
+            os.remove(image_path)
+
+    db.delete(item)
+    db.commit()
+
+    return {"message": "Item removido com sucesso"}
+
+@app.get("/api/outfits/daily")
+def get_daily_outfits(
+    weather: str = Query("moderate"),
+    occasion: str = Query("casual"),
+    temperature: int = Query(24),
+    current_user: User = Depends(get_current_user),
+    csrf_token: str = Depends(get_csrf_token),
+    db: Session = Depends(get_db)
+):
+    items = db.query(ClothingItem).filter(ClothingItem.user_id == current_user.id).all()
+
+    if not items:
+        return {"outfits": [], "message": "Adicione peças ao seu guarda-roupa primeiro"}
+
+    items_dict = []
+    for item in items:
+        item_dict = {
             "id": item.id,
-            "user_id": item.user_id,
-            "name": item.name,
             "category": item.category,
             "subcategory": item.subcategory,
             "color": item.color,
-            "brand": item.brand,
-            "size": item.size,
-            "season": item.season,
-            "tags": item.tags or [],
+            "color_hex": item.color_hex,
             "image_url": item.image_url,
-            "thumbnail_url": item.thumbnail_url,
-            "wear_count": item.wear_count,
-            "last_worn": item.last_worn.isoformat() if item.last_worn else None,
-            "created_at": item.created_at.isoformat() if item.created_at else None,
-            "is_favorite": item.is_favorite if hasattr(item, 'is_favorite') else False
-        })
-    
-    # Agrupar por categoria
-    categorized = {}
-    for item in items_data:
-        cat = item.get("category", "uncategorized")
-        if cat not in categorized:
-            categorized[cat] = []
-        categorized[cat].append(item)
-    
+            "fabric": item.fabric,
+            "brand": item.brand
+        }
+        items_dict.append(item_dict)
+
+    outfits = recommendation_engine.generate_daily_outfit(
+        items_dict, weather, occasion, temperature
+    )
+
     return {
-        "user_id": user_id,
-        "total_items": len(items_data),
-        "items": items_data,
-        "items_by_category": categorized
+        "outfits": outfits,
+        "weather": weather,
+        "occasion": occasion,
+        "temperature": temperature,
+        "greeting": f"Bom dia, {current_user.username}. Hoje faz {temperature}°C",
+        "csrf_token": csrf_token  # Novo token para próxima requisição
     }
 
-@app.get("/api/recommend-outfit")
-def recommend_outfit(
-    user_id: str,
-    occasion: str = "casual",
-    weather: str = "moderate",
-    limit: int = 5,
+@app.post("/api/outfits/save")
+def save_outfit(
+    outfit_data: OutfitCreate,
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Gera recomendações de looks"""
-    # Buscar itens do usuário
-    user_items = db.query(ClothingItem).filter(
-        ClothingItem.user_id == user_id,
-        ClothingItem.is_active == True
-    ).all()
-    
-    if len(user_items) < 2:
-        return {
-            "user_id": user_id,
-            "message": "Adicione pelo menos 2 itens ao seu guarda-roupa",
-            "recommendations": []
-        }
-    
-    # Converter para dict
+
+    outfit = Outfit(
+        id=generate_uuid(),
+        user_id=current_user.id,
+        name=outfit_data.name,
+        item_ids=outfit_data.item_ids,
+        occasion=outfit_data.occasion,
+        weather=outfit_data.weather,
+        temperature=outfit_data.temperature,
+        style=outfit_data.style,
+        notes=outfit_data.notes,
+        saved_at=datetime.utcnow()
+    )
+
+    db.add(outfit)
+    db.commit()
+    db.refresh(outfit)
+
+    return {"message": "Look salvo com sucesso", "outfit": outfit}
+
+@app.post("/api/chat/message")
+async def send_chat_message(
+    message: ChatMessageCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+
+    user_message = ChatMessage(
+        id=generate_uuid(),
+        user_id=current_user.id,
+        content=message.content,
+        is_user=True,
+        message_type=message.message_type,
+        created_at=datetime.utcnow()
+    )
+    db.add(user_message)
+
+    ai_response_content = "Olá! Sou sua stylist virtual. Como posso ajudar você hoje?"
+    ai_response_data = {
+        "type": "greeting",
+        "options": ["montar_look", "combinar_peças", "analisar_guarda_roupa", "dicas_estilo"]
+    }
+
+    ai_message = ChatMessage(
+        id=generate_uuid(),
+        user_id=current_user.id,
+        content=ai_response_content,
+        is_user=False,
+        message_type="ai_response",
+        ai_response=ai_response_data,
+        created_at=datetime.utcnow()
+    )
+    db.add(ai_message)
+
+    db.commit()
+
+    return {
+        "user_message": user_message,
+        "ai_response": ai_message
+    }
+
+@app.post("/api/colors/analyze")
+def analyze_colors(
+    analysis_request: ColorAnalysisRequest,
+    current_user: User = Depends(get_current_user)
+):
+
+    analysis = recommendation_engine.analyze_color_season(
+        analysis_request.skin_tone,
+        analysis_request.eye_color,
+        analysis_request.hair_color
+    )
+
+    return {
+        "analysis": analysis,
+        "user_id": current_user.id,
+        "analyzed_at": datetime.utcnow()
+    }
+
+@app.get("/api/shopping/recommendations")
+def get_shopping_recommendations(
+    current_user: User = Depends(get_current_user),
+    csrf_token: str = Depends(get_csrf_token),
+    db: Session = Depends(get_db)
+):
+    user_items = db.query(ClothingItem).filter(ClothingItem.user_id == current_user.id).all()
+
+    if not user_items:
+        return {"recommendations": [], "message": "Adicione peças ao seu guarda-roupa para receber recomendações"}
+
     items_dict = []
     for item in user_items:
-        items_dict.append({
+        item_dict = {
             "id": item.id,
-            "name": item.name,
             "category": item.category,
+            "subcategory": item.subcategory,
             "color": item.color,
+            "color_hex": item.color_hex,
             "brand": item.brand,
-            "tags": item.tags or [],
-            "season": item.season,
-            "wear_count": item.wear_count,
-            "image_url": item.image_url,
-            "is_favorite": item.is_favorite if hasattr(item, 'is_favorite') else False
-        })
-    
-    # Gerar recomendações
-    recommendations = recommendation_engine.generate_outfits(
-        items_dict, occasion, weather, limit
-    )
-    
-    return {
-        "user_id": user_id,
-        "occasion": occasion,
-        "weather": weather,
-        "total_recommendations": len(recommendations),
-        "recommendations": recommendations
-    }
-
-@app.post("/api/save-outfit")
-def save_outfit(outfit: OutfitCreate, user_id: str = "demo", db: Session = Depends(get_db)):
-    """Salva um outfit favorito"""
-    outfit_id = str(uuid.uuid4())
-    
-    # Verificar se todos os itens existem
-    for item_id in outfit.items:
-        item = db.query(ClothingItem).filter(ClothingItem.id == item_id).first()
-        if not item:
-            raise HTTPException(status_code=404, detail=f"Item {item_id} não encontrado")
-    
-    # Criar outfit no banco
-    db_outfit = Outfit(
-        id=outfit_id,
-        user_id=user_id,
-        name=outfit.name,
-        occasion=outfit.occasion,
-        weather=outfit.weather,
-        items=outfit.items,
-        is_favorite=outfit.is_favorite
-    )
-    
-    db.add(db_outfit)
-    db.commit()
-    db.refresh(db_outfit)
-    
-    return {
-        "success": True,
-        "outfit_id": outfit_id,
-        "message": "Outfit salvo com sucesso",
-        "data": {
-            "id": db_outfit.id,
-            "name": db_outfit.name,
-            "occasion": db_outfit.occasion,
-            "items": db_outfit.items,
-            "created_at": db_outfit.created_at.isoformat() if db_outfit.created_at else None
+            "price": item.price
         }
-    }
+        items_dict.append(item_dict)
 
-@app.get("/api/outfits/{user_id}")
-def get_user_outfits(user_id: str, db: Session = Depends(get_db)):
-    """Retorna todos os outfits do usuário"""
-    outfits = db.query(Outfit).filter(
-        Outfit.user_id == user_id
-    ).order_by(Outfit.created_at.desc()).all()
-    
-    outfits_data = []
-    for outfit in outfits:
-        # Buscar detalhes dos itens
-        items_details = []
-        for item_id in outfit.items:
-            item = db.query(ClothingItem).filter(ClothingItem.id == item_id).first()
-            if item:
-                items_details.append({
-                    "id": item.id,
-                    "name": item.name,
-                    "category": item.category,
-                    "color": item.color,
-                    "image_url": item.image_url
-                })
-        
-        outfits_data.append({
-            "id": outfit.id,
-            "name": outfit.name,
-            "occasion": outfit.occasion,
-            "weather": outfit.weather,
-            "items": items_details,
-            "rating": outfit.rating,
-            "worn_count": outfit.worn_count,
-            "last_worn": outfit.last_worn.isoformat() if outfit.last_worn else None,
-            "is_favorite": outfit.is_favorite,
-            "created_at": outfit.created_at.isoformat() if outfit.created_at else None
-        })
-    
+    recommendations = recommendation_engine.generate_shopping_recommendations(items_dict, [])
+
     return {
-        "user_id": user_id,
-        "total_outfits": len(outfits_data),
-        "outfits": outfits_data
+        "recommendations": recommendations,
+        "total_items": len(user_items),
+        "analysis_date": datetime.utcnow(),
+        "csrf_token": csrf_token
     }
 
-@app.get("/api/stats/{user_id}")
-def get_user_stats(user_id: str, db: Session = Depends(get_db)):
-    """Retorna estatísticas do usuário"""
-    total_items = db.query(ClothingItem).filter(
-        ClothingItem.user_id == user_id,
-        ClothingItem.is_active == True
-    ).count()
-    
-    # Itens por categoria
-    categories_result = db.query(
-        ClothingItem.category,
-        func.count(ClothingItem.id)
-    ).filter(
-        ClothingItem.user_id == user_id,
-        ClothingItem.is_active == True
-    ).group_by(ClothingItem.category).all()
-    
-    categories = {cat: count for cat, count in categories_result}
-    
-    # Item mais usado
-    most_worn_item = db.query(ClothingItem).filter(
-        ClothingItem.user_id == user_id,
-        ClothingItem.is_active == True
-    ).order_by(ClothingItem.wear_count.desc()).first()
-    
-    # Últimas adições
-    recent_additions = db.query(ClothingItem).filter(
-        ClothingItem.user_id == user_id,
-        ClothingItem.is_active == True
-    ).order_by(ClothingItem.created_at.desc()).limit(5).all()
-    
-    recent_items = []
-    for item in recent_additions:
-        recent_items.append({
-            "id": item.id,
-            "name": item.name,
-            "category": item.category,
-            "color": item.color,
-            "created_at": item.created_at.isoformat() if item.created_at else None
-        })
-    
-    # Total de outfits
-    total_outfits = db.query(Outfit).filter(Outfit.user_id == user_id).count()
-    
-    # Outfits mais usados
-    favorite_outfits = db.query(Outfit).filter(
-        Outfit.user_id == user_id,
-        Outfit.is_favorite == True
-    ).limit(3).all()
-    
-    favorite_outfits_data = []
-    for outfit in favorite_outfits:
-        favorite_outfits_data.append({
-            "id": outfit.id,
-            "name": outfit.name,
-            "occasion": outfit.occasion,
-            "worn_count": outfit.worn_count
-        })
-    
-    return {
-        "user_id": user_id,
-        "stats": {
-            "total_items": total_items,
-            "total_outfits": total_outfits,
-            "categories": categories,
-            "most_worn": {
-                "id": most_worn_item.id if most_worn_item else None,
-                "name": most_worn_item.name if most_worn_item else None,
-                "wear_count": most_worn_item.wear_count if most_worn_item else 0,
-                "category": most_worn_item.category if most_worn_item else None
-            },
-            "recent_additions": recent_items,
-            "favorite_outfits": favorite_outfits_data,
-            "most_common_color": "A definir",  # Pode implementar depois
-            "usage_rate": f"{(total_items / 100) * 100:.1f}%" if total_items > 0 else "0%"
-        }
-    }
+@app.get("/api/stats")
+def get_user_stats(
+    current_user: User = Depends(get_current_user),
+    csrf_token: str = Depends(get_csrf_token),
+    db: Session = Depends(get_db)
+):
+    items = db.query(ClothingItem).filter(ClothingItem.user_id == current_user.id).all()
 
-@app.post("/api/wear/{item_id}")
-def mark_item_worn(item_id: str, db: Session = Depends(get_db)):
-    """Marca um item como usado hoje"""
-    item = db.query(ClothingItem).filter(ClothingItem.id == item_id).first()
-    
-    if not item:
-        raise HTTPException(status_code=404, detail="Item não encontrado")
-    
-    item.wear_count = (item.wear_count or 0) + 1
-    item.last_worn = datetime.utcnow()
-    
-    db.commit()
-    db.refresh(item)
-    
-    return {
-        "success": True,
-        "item_id": item_id,
-        "wear_count": item.wear_count,
-        "last_worn": item.last_worn.isoformat() if item.last_worn else None
-    }
-
-@app.post("/api/wear-outfit/{outfit_id}")
-def mark_outfit_worn(outfit_id: str, db: Session = Depends(get_db)):
-    """Marca um outfit como usado hoje"""
-    outfit = db.query(Outfit).filter(Outfit.id == outfit_id).first()
-    
-    if not outfit:
-        raise HTTPException(status_code=404, detail="Outfit não encontrado")
-    
-    outfit.worn_count = (outfit.worn_count or 0) + 1
-    outfit.last_worn = datetime.utcnow()
-    
-    # Atualizar contador de uso para cada item do outfit
-    for item_id in outfit.items:
-        item = db.query(ClothingItem).filter(ClothingItem.id == item_id).first()
-        if item:
-            item.wear_count = (item.wear_count or 0) + 1
-            item.last_worn = datetime.utcnow()
-    
-    db.commit()
-    
-    return {
-        "success": True,
-        "outfit_id": outfit_id,
-        "worn_count": outfit.worn_count,
-        "last_worn": outfit.last_worn.isoformat() if outfit.last_worn else None
-    }
-
-@app.delete("/api/item/{item_id}")
-def delete_item(item_id: str, db: Session = Depends(get_db)):
-    """Remove um item do guarda-roupa (soft delete)"""
-    item = db.query(ClothingItem).filter(ClothingItem.id == item_id).first()
-    
-    if not item:
-        raise HTTPException(status_code=404, detail="Item não encontrado")
-    
-    # Soft delete
-    item.is_active = False
-    
-    db.commit()
-    
-    return {
-        "success": True,
-        "message": "Item removido com sucesso",
-        "item_id": item_id
-    }
-
-@app.get("/api/shopping-suggestions/{user_id}")
-def get_shopping_suggestions(user_id: str, db: Session = Depends(get_db)):
-    """Retorna sugestões de compra baseadas no guarda-roupa"""
-    user_items = db.query(ClothingItem).filter(
-        ClothingItem.user_id == user_id,
-        ClothingItem.is_active == True
-    ).all()
-    
-    if not user_items:
-        return {
-            "user_id": user_id,
-            "message": "Adicione itens ao seu guarda-roupa para receber sugestões",
-            "suggestions": []
-        }
-    
-    # Análise do guarda-roupa
     categories = {}
-    colors = {}
-    
-    for item in user_items:
-        # Contar categorias
+    for item in items:
         cat = item.category
         categories[cat] = categories.get(cat, 0) + 1
-        
-        # Contar cores
-        color = item.color
-        colors[color] = colors.get(color, 0) + 1
-    
-    suggestions = []
-    
-    # Sugerir itens básicos que faltam
-    basic_items = [
-        {"name": "Camiseta branca básica", "category": "top", "color": "#FFFFFF", "priority": "high"},
-        {"name": "Jeans azul escuro", "category": "bottom", "color": "#1E3A8A", "priority": "high"},
-        {"name": "Blazer preto", "category": "outerwear", "color": "#000000", "priority": "medium"},
-        {"name": "Vestido preto básico", "category": "dress", "color": "#000000", "priority": "medium"},
-        {"name": "Tênis branco", "category": "shoes", "color": "#FFFFFF", "priority": "high"}
-    ]
-    
-    for basic in basic_items:
-        exists = False
-        for item in user_items:
-            if (item.category == basic["category"] and 
-                item.color.lower() == basic["color"].lower()):
-                exists = True
-                break
-        
-        if not exists:
-            suggestions.append({
-                "type": "basic_item",
-                "item": basic["name"],
-                "category": basic["category"],
-                "color": basic["color"],
-                "reason": "Item básico essencial para qualquer guarda-roupa",
-                "priority": basic["priority"]
-            })
-    
-    # Sugerir complementos para peças pouco utilizadas
-    for item in user_items:
-        if item.wear_count < 3:  # Peças pouco usadas
-            suggestions.append({
-                "type": "complement",
-                "for_item": item.name,
-                "suggestion": f"Acessórios para combinar com {item.color}",
-                "reason": f"Esta peça foi usada apenas {item.wear_count} vezes",
-                "priority": "low"
-            })
-    
+
+    saved_outfits = db.query(Outfit).filter(Outfit.user_id == current_user.id).count()
+
+    chat_messages = db.query(ChatMessage).filter(ChatMessage.user_id == current_user.id).count()
+
+    total_value = sum(item.price for item in items if item.price)
+
+    active_sessions = db.query(UserSession).filter(
+        UserSession.user_id == current_user.id,
+        UserSession.is_active == True
+    ).count()
+
     return {
-        "user_id": user_id,
-        "total_suggestions": len(suggestions),
-        "wardrobe_analysis": {
-            "total_items": len(user_items),
-            "categories": categories,
-            "top_colors": dict(sorted(colors.items(), key=lambda x: x[1], reverse=True)[:5])
-        },
-        "suggestions": suggestions[:10]  # Limitar a 10 sugestões
+        "total_items": len(items),
+        "categories": categories,
+        "saved_outfits": saved_outfits,
+        "chat_messages": chat_messages,
+        "total_value": total_value,
+        "active_sessions": active_sessions,
+        "member_since": current_user.created_at,
+        "csrf_token": csrf_token
     }
 
-# Endpoint para servir imagens
-@app.get("/uploads/{filename}")
-def serve_image(filename: str):
-    """Serve imagens do diretório de uploads"""
-    file_path = f"uploads/{filename}"
-    
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Imagem não encontrada")
-    
-    from fastapi.responses import FileResponse
-    return FileResponse(file_path)
+@app.get("/api/health")
+def health_check():
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow(),
+        "service": settings.APP_NAME,
+        "version": settings.APP_VERSION,
+        "security": {
+            "csrf_enabled": True,
+            "jwt_enabled": True,
+            "rate_limiting": True
+        }
+    }
+
+@app.on_event("startup")
+def on_startup():
+    init_db()
+
+    db = SessionLocal()
+    try:
+        demo_user = db.query(User).filter(User.email == "demo@closset.com").first()
+        if not demo_user:
+            hashed_password = get_password_hash("Demo@123")  # Senha mais segura
+            demo_user = User(
+                id=generate_uuid(),
+                username="demo",
+                email="demo@closset.com",
+                hashed_password=hashed_password,
+                style_preference="casual",
+                skin_tone="medium",
+                created_at=datetime.utcnow()
+            )
+            db.add(demo_user)
+            db.commit()
+
+            style_profile = StyleProfile(
+                id=generate_uuid(),
+                user_id=demo_user.id,
+                preferred_styles=["casual", "modern"],
+                preferred_colors=["#4169E1", "#8B0000", "#FFFFFF"],
+                avoided_colors=["#FFD700", "#00FF00"],
+                color_palette=["#FFFFFF", "#000000", "#4169E1", "#8B0000"]
+            )
+            db.add(style_profile)
+            db.commit()
+
+            print("Usuário de demonstração criado: demo@closset.com / Demo@123")
+    finally:
+        db.close()
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        ssl_keyfile="key.pem" if os.path.exists("key.pem") else None,
+        ssl_certfile="cert.pem" if os.path.exists("cert.pem") else None
+    )
